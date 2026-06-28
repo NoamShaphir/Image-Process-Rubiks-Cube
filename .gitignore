@@ -12,6 +12,7 @@
 !04_Final_Pipeline.ipynb
 !Final_Project_Rubiks_Cube_Report.docx
 !.gitignore
+!README.md
 
 # Allow all contents of data directory recursively
 !data/**
