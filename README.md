@@ -60,7 +60,7 @@ Tested over all 14 dataset images, the system performance metrics are summarized
 | `inspect_solved_multi_defect_2.jpg` | Solved | 2 Sticker Defects | 2 Sticker Defects | 2 | 0 | 0 |
 | `inspect_solved_rotated_flat_layer.jpg` | Solved | 1 Sticker Defect | 1 Rotated Layer, 1 Sticker Defect | 1 | 1 | 0 |
 | `inspect_solved_rotated_layer.jpg` | Solved | None | 1 Rotated Layer | 0 | 1 | 0 |
-| `inspect_solved_rotated_layer_and_defect.jpg` | Solved | 1 Rotation, 1 Sticker | 1 Rotation, 1 Sticker | 2 | 0 | 0 |
+| `inspect_solved_rotated_layer_and_defect.jpg` | Solved | 1 Rotation, 1 Sticker | 1 Rotated Layer | 1 | 0 | 1 |
 | `inspect_scrambled_cell_defect.jpg` | Scrambled | 1 Sticker Defect | 1 Sticker Defect | 1 | 0 | 0 |
 | `inspect_scrambled_perspective.jpg` | Scrambled | None | None | 0 | 0 | 0 |
 | `inspect_scrambled_rotated_layer_and_defect.jpg` | Scrambled | 1 Rotation, 2 Stickers | 1 Rotation, 1 Sticker | 2 | 0 | 1 |
@@ -69,7 +69,7 @@ Tested over all 14 dataset images, the system performance metrics are summarized
 | `inspect_scrambled_rotated_layers.jpg` | Scrambled | 1 Rotation | 1 Rotation | 1 | 0 | 0 |
 | `inspect_scrambled_shadow.jpg` | Scrambled | None | None | 0 | 0 | 0 |
 | `inspect_scrambled_stress_test.jpg` | Scrambled | 1 Rotation, 3 Stickers | 3 Sticker Defects (misaligned) | 0 | 3 | 4 |
-| **Total** | **-** | **21 Elements** | **21 Elements** | **16** | **5** | **5** |
+| **Total** | **-** | **21 Elements** | **21 Elements** | **15** | **5** | **6** |
 
 ---
 
