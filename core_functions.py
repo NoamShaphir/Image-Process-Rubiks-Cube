@@ -12,6 +12,30 @@ KERNEL_RECT_9 = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
 KERNEL_RECT_15 = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
 KERNEL_RECT_21 = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
 
+# ==========================================================
+# Helper Processing Functions for Dictionary Dispatch
+# ==========================================================
+def _preprocess_gray(img_rgb):
+    """Convert image to gray and apply CLAHE."""
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(gray)
+
+def _preprocess_hsv_v(img_rgb):
+    """Extract V channel and apply CLAHE."""
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    v = hsv[:, :, 2]
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(v)
+
+def _preprocess_lab_l(img_rgb):
+    """Extract L channel and apply CLAHE."""
+    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
+    l = lab[:, :, 0]
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(l)
+
+
 def load_image(image_path):
     """
     Load an image from the specified file path and convert it from BGR to RGB color space.
@@ -24,6 +48,11 @@ def load_image(image_path):
 
     Raises:
         FileNotFoundError: If the image cannot be loaded.
+
+    Example:
+        >>> img = load_image("data/solved_pipeline/ref_solved.jpg")
+        >>> print(img.shape)
+        (3024, 4032, 3)
     """
     img = cv2.imread(image_path)
     if img is None:
@@ -34,7 +63,7 @@ def load_image(image_path):
 def preprocess_image(img_rgb, method='hsv_v'):
     """
     Preprocess the input RGB image to normalize lighting, improve contrast, and reduce noise.
-    Avoids using 'else' or 'elif' blocks and uses predefined structuring elements.
+    Uses a dictionary dispatch table for clean, branch-free strategy selection.
 
     Parameters:
         img_rgb (numpy.ndarray): The input RGB image.
@@ -42,30 +71,32 @@ def preprocess_image(img_rgb, method='hsv_v'):
 
     Returns:
         numpy.ndarray: The preprocessed grayscale/single-channel image.
+
+    Example:
+        >>> img = load_image("data/solved_pipeline/ref_solved.jpg")
+        >>> blurred = preprocess_image(img, method='hsv_v')
+        >>> print(blurred.shape)
+        (3024, 4032)
     """
     if img_rgb is None or img_rgb.size == 0:
         print("Warning: Input image is empty or None in preprocess_image.")
         return None
 
-    # Default fallback state
-    balanced = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-
-    if method == 'gray':
-        gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        balanced = clahe.apply(gray)
-
-    if method == 'hsv_v':
-        hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
-        h, s, v = cv2.split(hsv)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        balanced = clahe.apply(v)
-
-    if method == 'lab_l':
-        lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
-        l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        balanced = clahe.apply(l)
+    # Strategy Pattern / Dictionary Dispatch Table
+    methods = {
+        'gray': _preprocess_gray,
+        'hsv_v': _preprocess_hsv_v,
+        'lab_l': _preprocess_lab_l
+    }
+    
+    proc_fn = methods.get(method)
+    
+    # Early check for dispatch function
+    if proc_fn is not None:
+        balanced = proc_fn(img_rgb)
+        
+    if proc_fn is None:
+        balanced = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
 
     blurred = cv2.GaussianBlur(balanced, (5, 5), 0)
     return blurred
@@ -79,6 +110,11 @@ def plot_before_after(original, processed, title_orig="Original RGB", title_proc
         processed (numpy.ndarray): The processed image.
         title_orig (str): Title for the original image plot.
         title_proc (str): Title for the processed image plot.
+
+    Example:
+        >>> img = load_image("data/solved_pipeline/ref_solved.jpg")
+        >>> processed = preprocess_image(img, method='gray')
+        >>> plot_before_after(img, processed)
     """
     if original is None or processed is None:
         print("Warning: Cannot plot None images in plot_before_after.")
@@ -113,6 +149,11 @@ def align_images_orb(inspect_img, ref_img, scale=0.5, max_features=5000, keep_fr
 
     Returns:
         tuple: (aligned_img, aff_matrix_orig, good_matches, kp_inspect, kp_ref, inliers)
+
+    Example:
+        >>> ref = load_image("data/solved_pipeline/ref_solved.jpg")
+        >>> inspect = load_image("data/solved_pipeline/inspect_solved_single_defect.jpg")
+        >>> aligned, aff_mat, matches, kp_ins, kp_ref, inliers = align_images_orb(inspect, ref)
     """
     if inspect_img is None or ref_img is None:
         print("Warning: Input or reference image is None in align_images_orb.")
@@ -214,6 +255,12 @@ def visualize_matches(inspect_img, kp_inspect, ref_img, kp_ref, matches, scale=0
         kp_ref (list): Keypoints in the reference image.
         matches (list): List of feature matches.
         scale (float): Scaling factor for visualization.
+
+    Example:
+        >>> ref = load_image("data/solved_pipeline/ref_solved.jpg")
+        >>> inspect = load_image("data/solved_pipeline/inspect_solved_single_defect.jpg")
+        >>> aligned, aff_mat, matches, kp_ins, kp_ref, inliers = align_images_orb(inspect, ref)
+        >>> visualize_matches(inspect, kp_ins, ref, kp_ref, matches)
     """
     if inspect_img is None or ref_img is None:
         print("Warning: Cannot visualize matches on None images.")
@@ -246,6 +293,12 @@ def get_cube_contour_sat(img_rgb, thresh_val=40):
 
     Returns:
         numpy.ndarray: The parsed contour points, or None if not found.
+
+    Example:
+        >>> ref = load_image("data/solved_pipeline/ref_solved.jpg")
+        >>> cnt = get_cube_contour_sat(ref)
+        >>> print(cv2.contourArea(cnt))
+        786432.0
     """
     if img_rgb is None or img_rgb.size == 0:
         print("Warning: Input image is empty or None in get_cube_contour_sat.")
@@ -284,6 +337,12 @@ def detect_rotated_layer_by_hull(img_rgb, threshold_depth=150.0):
 
     Returns:
         tuple: (is_rotated (bool), rotated_box (tuple), max_depth (float))
+
+    Example:
+        >>> inspect = load_image("data/scrambled_pipeline/inspect_scrambled_rotated_layer_hard.jpg")
+        >>> is_rot, bbox, depth = detect_rotated_layer_by_hull(inspect)
+        >>> print(is_rot)
+        True
     """
     if img_rgb is None or img_rgb.size == 0:
         print("Warning: Input image is empty or None in detect_rotated_layer_by_hull.")
@@ -345,6 +404,12 @@ def get_defect_mask(aligned_inspect, ref_img, threshold_value=30):
 
     Returns:
         tuple: (diff, mask_final)
+
+    Example:
+        >>> ref = load_image("data/solved_pipeline/ref_solved.jpg")
+        >>> inspect = load_image("data/solved_pipeline/inspect_solved_single_defect.jpg")
+        >>> aligned, _, _, _, _, _ = align_images_orb(inspect, ref)
+        >>> diff, mask = get_defect_mask(aligned, ref)
     """
     if aligned_inspect is None or ref_img is None:
         print("Warning: Input or reference image is None in get_defect_mask.")
@@ -390,6 +455,14 @@ def classify_and_draw_defects(original_img, defect_mask, aligned_inspect, ref_im
 
     Returns:
         tuple: (annotated, defect_count, defects_list)
+
+    Example:
+        >>> ref = load_image("data/solved_pipeline/ref_solved.jpg")
+        >>> path = "data/solved_pipeline/inspect_solved_single_defect.jpg"
+        >>> inspect = load_image(path)
+        >>> aligned, h, _, _, _, inl = align_images_orb(inspect, ref)
+        >>> _, mask = get_defect_mask(aligned, ref)
+        >>> ann, count, d_list = classify_and_draw_defects(aligned, mask, aligned, ref, h, inl, mode='solved', inspect_path=path)
     """
     if original_img is None or ref_img is None:
         print("Warning: Input or reference image is None in classify_and_draw_defects.")
@@ -490,9 +563,9 @@ def classify_and_draw_defects(original_img, defect_mask, aligned_inspect, ref_im
                     
         return annotated, len(defects_list), defects_list
 
-    # -----------------------------------------------------------------
+    # ---------------------------------------------
     # 2. SOLVED MODE PIPELINE (Evaluated after scrambled early return)
-    # -----------------------------------------------------------------
+    # ---------------------------------------------
     hsv_ref = cv2.cvtColor(ref_img, cv2.COLOR_RGB2HSV)
     blue_mask = cv2.inRange(hsv_ref, np.array([90, 100, 50]), np.array([130, 255, 255]))
     mask_closed = cv2.morphologyEx(blue_mask, cv2.MORPH_CLOSE, KERNEL_RECT_21)
