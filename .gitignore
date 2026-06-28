@@ -1,0 +1,17 @@
+# Ignore everything by default
+*
+
+# Allow directories
+!*/
+
+# Allow specific files
+!core_functions.py
+!01_Preprocessing.ipynb
+!02_Registration_Research.ipynb
+!03_Defect_Analysis.ipynb
+!04_Final_Pipeline.ipynb
+!Final_Project_Rubiks_Cube_Report.docx
+!.gitignore
+
+# Allow all contents of data directory recursively
+!data/**
