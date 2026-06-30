@@ -342,21 +342,22 @@ def get_cube_contour_sat(img_rgb, thresh_val=40):
         return None
     return max(inner_contours, key=cv2.contourArea)
 
-def detect_rotated_layer_by_hull(img_rgb, threshold_depth=150.0):
+def detect_rotated_layer_by_hull(img_rgb, threshold_depth_pct=3.0):
     """
-    Identify layer rotation by evaluating convexity defect depth of the Saturation contour.
+    Identify layer rotation by evaluating convexity defect depth of the Saturation contour,
+    normalized as a percentage of the cube's bounding box width.
     Avoids using 'else' / 'elif' blocks.
 
     Parameters:
         img_rgb (numpy.ndarray): The input image.
-        threshold_depth (float): Depth threshold to trigger a rotation defect.
+        threshold_depth_pct (float): Depth threshold (as a percentage of cube width) to trigger a rotation.
 
     Returns:
-        tuple: (is_rotated (bool), rotated_box (tuple), max_depth (float))
+        tuple: (is_rotated (bool), rotated_box (tuple), max_depth_pct (float))
 
     Example:
         >>> inspect = load_image("data/scrambled_pipeline/inspect_scrambled_rotated_layer_hard.jpg")
-        >>> is_rot, bbox, depth = detect_rotated_layer_by_hull(inspect)
+        >>> is_rot, bbox, depth_pct = detect_rotated_layer_by_hull(inspect)
         >>> print(is_rot)
         True
     """
@@ -369,6 +370,8 @@ def detect_rotated_layer_by_hull(img_rgb, threshold_depth=150.0):
         print("Warning: Cube contour is None in detect_rotated_layer_by_hull.")
         return False, None, 0.0
         
+    cx, cy, cw, ch = cv2.boundingRect(contour)
+    
     epsilon = 0.002 * cv2.arcLength(contour, True)
     approx_contour = cv2.approxPolyDP(contour, epsilon, True)
     
@@ -386,27 +389,35 @@ def detect_rotated_layer_by_hull(img_rgb, threshold_depth=150.0):
         return False, None, 0.0
         
     max_depth = 0.0
-    defect_points = []
     for i in range(defects.shape[0]):
         s, e, f, d = defects[i, 0]
         depth_px = d / 256.0
         if depth_px > max_depth:
             max_depth = depth_px
-        if depth_px > threshold_depth:
-            far_pt = approx_contour[f][0]
-            defect_points.append(far_pt)
             
-    if max_depth > threshold_depth and len(defect_points) >= 1:
-        defect_points = np.array(defect_points)
-        x, y, w, h = cv2.boundingRect(defect_points)
-        padding = 40
-        x = max(0, x - padding)
-        y = max(0, y - padding)
-        w = w + 2 * padding
-        h = h + 2 * padding
-        return True, (x, y, w, h), max_depth
+    max_depth_pct = (max_depth / cw) * 100.0 if cw > 0 else 0.0
+    defect_points = []
+    
+    if max_depth_pct > threshold_depth_pct:
+        for i in range(defects.shape[0]):
+            s, e, f, d = defects[i, 0]
+            depth_px = d / 256.0
+            depth_pct = (depth_px / cw) * 100.0 if cw > 0 else 0.0
+            if depth_pct > threshold_depth_pct:
+                far_pt = approx_contour[f][0]
+                defect_points.append(far_pt)
+                
+        if len(defect_points) >= 1:
+            defect_points = np.array(defect_points)
+            x, y, w, h = cv2.boundingRect(defect_points)
+            padding = 40
+            x = max(0, x - padding)
+            y = max(0, y - padding)
+            w = w + 2 * padding
+            h = h + 2 * padding
+            return True, (x, y, w, h), max_depth_pct
         
-    return False, None, max_depth
+    return False, None, max_depth_pct
 
 def get_defect_mask(aligned_inspect, ref_img, threshold_value=30):
     """
@@ -458,6 +469,7 @@ def classify_and_draw_defects(original_img, defect_mask, aligned_inspect, ref_im
     Run pipeline checks to classify and draw bounding boxes around defects on the aligned image.
     Uses 'Early Returns' to fully eliminate all 'else'/'elif' statements.
     Optimizes performance by pre-converting to HSV and precomputing cell coordinate grids.
+    All geometric metrics (such as convexity depth) are scale-normalized.
 
     Parameters:
         original_img (numpy.ndarray): Original inspection image.
@@ -538,6 +550,9 @@ def classify_and_draw_defects(original_img, defect_mask, aligned_inspect, ref_im
         except Exception as e:
             print(f"Warning: scrambled convexity defects failed: {e}")
             
+        # Scale-normalization of convexity depth (as a percentage of cube width)
+        max_depth_pct = (max_depth / cw) * 100.0 if cw > 0 else 0.0
+        
         # Segment black patches directly on the perfectly aligned image inside the eroded ref mask
         ref_mask = np.zeros(ref_img.shape[:2], dtype=np.uint8)
         cv2.drawContours(ref_mask, [ref_cnt], -1, 255, -1)
@@ -565,7 +580,7 @@ def classify_and_draw_defects(original_img, defect_mask, aligned_inspect, ref_im
         aligned_success = (inliers >= 20)
         is_rotated_layer = False
         if not aligned_success:
-            is_rotated_layer = (max_depth > 33.5)
+            is_rotated_layer = (max_depth_pct > 3.0)
             
         defects_list = []
         
@@ -614,60 +629,10 @@ def classify_and_draw_defects(original_img, defect_mask, aligned_inspect, ref_im
         return annotated, len(defects_list), defects_list
 
     # -----------------------------------------------------------------
-    # 2. SOLVED MODE PIPELINE
+    # 2. SOLVED MODE PIPELINE (Clean scale-invariant reference-grid checks)
     # -----------------------------------------------------------------
-    inspect_orig = load_image(inspect_path)
-    if inspect_orig is None:
-        inspect_orig = aligned_inspect.copy()
-        
-    hsv_inspect = cv2.cvtColor(inspect_orig, cv2.COLOR_RGB2HSV)
-    blue_mask_inspect = cv2.inRange(hsv_inspect, np.array([90, 100, 50]), np.array([130, 255, 255]))
-    blue_mask_cleaned = cv2.morphologyEx(blue_mask_inspect, cv2.MORPH_OPEN, KERNEL_RECT_5)
-    contours_blue_inspect, _ = cv2.findContours(blue_mask_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    all_pts = []
-    for c_cnt in contours_blue_inspect:
-        if cv2.contourArea(c_cnt) > 5000:
-            all_pts.extend(c_cnt)
-            
-    cx_i, cy_i, cw_i, ch_i = cx_ref, cy_ref, cw_ref, ch_ref
-    if all_pts:
-        all_pts = np.vstack(all_pts)
-        cx_i, cy_i, cw_i, ch_i = cv2.boundingRect(all_pts)
-        
-        aspect = cw_i / ch_i
-        
-        if aspect > 1.6:
-            is_top_missing = (cy_i >= 1950)
-            if is_top_missing:
-                cy_i = cy_i - int(ch_i * 0.5)
-                ch_i = int(ch_i * 1.5)
-            if not is_top_missing:
-                ch_i = int(ch_i * 1.5)
-        if aspect <= 1.6 and ch_i >= 600:
-            ch_i = ch_ref
-            
-        aspect = cw_i / ch_i
-        if aspect < 1.1:
-            is_left_missing = (cx_i >= 930)
-            if is_left_missing:
-                cx_i = cx_i - int(cw_i * 0.5)
-                cw_i = int(cw_i * 1.5)
-            if not is_left_missing:
-                cw_i = int(cw_i * 1.5)
-        if aspect >= 1.1 and cw_i >= 800:
-            cw_i = cw_ref
-            
-    pts_src = np.float32([[cx_i, cy_i], [cx_i + cw_i, cy_i], [cx_i + cw_i, cy_i + ch_i], [cx_i, cy_i + ch_i]])
-    pts_dst = np.float32([[cx_ref, cy_ref], [cx_ref + cw_ref, cy_ref], [cx_ref + cw_ref, cy_ref + ch_ref], [cx_ref, cy_ref + ch_ref]])
-    
-    M_forced = cv2.getPerspectiveTransform(pts_src, pts_dst)
-    aligned_forced = cv2.warpPerspective(inspect_orig, M_forced, (inspect_orig.shape[1], inspect_orig.shape[0]))
-    
-    annotated = aligned_forced.copy()
-    
     # Perform HSV conversion exactly ONCE on the entire image before checking loops
-    hsv_aligned = cv2.cvtColor(aligned_forced, cv2.COLOR_RGB2HSV)
+    hsv_aligned = cv2.cvtColor(aligned_inspect, cv2.COLOR_RGB2HSV)
     blue_m = cv2.inRange(hsv_aligned, np.array([90, 100, 50]), np.array([130, 255, 255]))
     
     # Precompute cell boundaries and store them to avoid redundant math inside loops
