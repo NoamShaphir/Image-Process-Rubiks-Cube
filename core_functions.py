@@ -35,6 +35,33 @@ def _preprocess_lab_l(img_rgb):
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return clahe.apply(l)
 
+def get_quad_corners(cnt):
+    """
+    Extract the 4 extreme corners of a given contour based on x + y and x - y sums/differences.
+    Returns them in a consistent order: Top-Left, Top-Right, Bottom-Right, Bottom-Left.
+
+    Parameters:
+        cnt (numpy.ndarray): The input contour points.
+
+    Returns:
+        numpy.ndarray: Ordered float32 corner points of shape (4, 2).
+        
+    Example:
+        >>> cnt = np.array([[[10, 10]], [[100, 10]], [[100, 100]], [[10, 100]]])
+        >>> corners = get_quad_corners(cnt)
+        >>> print(corners[0])
+        [10. 10.]
+    """
+    pts = np.atleast_2d(cnt.squeeze())
+    s = pts[:, 0] + pts[:, 1]
+    d = pts[:, 0] - pts[:, 1]
+    
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    tr = pts[np.argmax(d)]
+    bl = pts[np.argmin(d)]
+    
+    return np.array([tl, tr, br, bl], dtype="float32")
 
 def load_image(image_path):
     """
@@ -136,9 +163,10 @@ def plot_before_after(original, processed, title_orig="Original RGB", title_proc
 
 def align_images_orb(inspect_img, ref_img, scale=0.5, max_features=5000, keep_fraction=0.15):
     """
-    Align the inspection image to the reference image using ORB feature matching 
-    and 2D Affine transformation.
-    Includes print messages for warning on early exits and has no 'else'/'elif' statements.
+    Align the inspection image to the reference image. Prefers geometric Corner-Based 
+    Perspective Registration for robust color-noise handling, with an ORB feature matching 
+    fallback if outer contours cannot be detected.
+    Also runs ORB on the original images to return the correct count of inliers for classification.
 
     Parameters:
         inspect_img (numpy.ndarray): The input inspection image.
@@ -148,21 +176,22 @@ def align_images_orb(inspect_img, ref_img, scale=0.5, max_features=5000, keep_fr
         keep_fraction (float): Fraction of top matches to keep.
 
     Returns:
-        tuple: (aligned_img, aff_matrix_orig, good_matches, kp_inspect, kp_ref, inliers)
+        tuple: (aligned_img, h_matrix, good_matches, kp_inspect, kp_ref, inliers)
 
     Example:
         >>> ref = load_image("data/solved_pipeline/ref_solved.jpg")
         >>> inspect = load_image("data/solved_pipeline/inspect_solved_single_defect.jpg")
-        >>> aligned, aff_mat, matches, kp_ins, kp_ref, inliers = align_images_orb(inspect, ref)
+        >>> aligned, h_mat, matches, kp_ins, kp_ref, inliers = align_images_orb(inspect, ref)
     """
     if inspect_img is None or ref_img is None:
         print("Warning: Input or reference image is None in align_images_orb.")
         return None, None, [], [], [], 0
 
     h_orig, w_orig = ref_img.shape[:2]
+    
+    # 1. Run ORB first on unaligned images to count inliers (acting as our straightness/alignment success feature)
     w_feat = int(w_orig * scale)
     h_feat = int(h_orig * scale)
-    
     ref_feat = cv2.resize(ref_img, (w_feat, h_feat))
     inspect_feat = cv2.resize(inspect_img, (w_feat, h_feat))
     
@@ -173,70 +202,57 @@ def align_images_orb(inspect_img, ref_img, scale=0.5, max_features=5000, keep_fr
     kp_inspect, des_inspect = orb.detectAndCompute(gray_inspect, None)
     kp_ref, des_ref = orb.detectAndCompute(gray_ref, None)
     
-    if des_inspect is None or des_ref is None:
-        print("Warning: Failed to compute ORB descriptors (no features found in one of the images).")
-        return inspect_img.copy(), None, [], kp_inspect, kp_ref, 0
+    inliers = 0
+    good_matches = []
+    
+    if des_inspect is not None and des_ref is not None:
+        matcher = cv2.DescriptorMatcher_create(cv2.DESCRIPTOR_MATCHER_BRUTEFORCE_HAMMING)
+        matches = matcher.match(des_inspect, des_ref, None)
+        sorted_matches = sorted(matches, key=lambda x: x.distance)
+        num_good = max(10, int(len(sorted_matches) * keep_fraction))
+        good_matches = sorted_matches[:num_good]
         
-    matcher = cv2.DescriptorMatcher_create(cv2.DESCRIPTOR_MATCHER_BRUTEFORCE_HAMMING)
-    matches = matcher.match(des_inspect, des_ref, None)
+        if len(good_matches) >= 4:
+            points_inspect = np.float32([kp_inspect[m.queryIdx].pt for m in good_matches])
+            points_ref = np.float32([kp_ref[m.trainIdx].pt for m in good_matches])
+            try:
+                _, inliers_mask = cv2.estimateAffine2D(points_inspect, points_ref, method=cv2.RANSAC, ransacReprojThreshold=5.0)
+                if inliers_mask is not None:
+                    inliers = int(np.sum(inliers_mask))
+            except Exception as e:
+                print(f"Warning: RANSAC estimateAffine2D failed: {e}")
+
+    # 2. Try Corner-Based Perspective Registration (highly robust to color noise)
+    ref_cnt = get_cube_contour_sat(ref_img, thresh_val=40)
+    ins_cnt = get_cube_contour_sat(inspect_img, thresh_val=40)
     
-    sorted_matches = sorted(matches, key=lambda x: x.distance)
-    num_good = max(10, int(len(sorted_matches) * keep_fraction))
-    good_matches = sorted_matches[:num_good]
-    
+    if ref_cnt is not None and ins_cnt is not None:
+        try:
+            ref_pts = get_quad_corners(ref_cnt)
+            ins_pts = get_quad_corners(ins_cnt)
+            H = cv2.getPerspectiveTransform(ins_pts, ref_pts)
+            aligned_img = cv2.warpPerspective(inspect_img, H, (w_orig, h_orig))
+            return aligned_img, H, good_matches, kp_inspect, kp_ref, inliers
+        except Exception as e:
+            print(f"Warning: Corner alignment failed: {e}. Falling back to ORB.")
+            
+    # 3. Fallback to ORB warp if corners could not be found
     if len(good_matches) < 4:
-        print("Warning: Insufficient feature matches (less than 4). Alignment aborted.")
+        print("Warning: Fallback ORB matching failed (too few matches).")
         return inspect_img.copy(), None, good_matches, kp_inspect, kp_ref, 0
         
     points_inspect = np.float32([kp_inspect[m.queryIdx].pt for m in good_matches])
     points_ref = np.float32([kp_ref[m.trainIdx].pt for m in good_matches])
     
     aff_matrix_feat = None
-    inliers_mask = None
     try:
-        aff_matrix_feat, inliers_mask = cv2.estimateAffine2D(
-            points_inspect, points_ref, 
-            method=cv2.RANSAC, 
-            ransacReprojThreshold=5.0
-        )
-    except Exception as e:
-        print(f"Warning: RANSAC estimateAffine2D failed: {e}")
+        aff_matrix_feat, _ = cv2.estimateAffine2D(points_inspect, points_ref, method=cv2.RANSAC, ransacReprojThreshold=5.0)
+    except:
+        pass
         
     if aff_matrix_feat is None:
-        try:
-            aff_matrix_feat, inliers_mask = cv2.estimateAffinePartial2D(
-                points_inspect, points_ref, 
-                method=cv2.RANSAC, 
-                ransacReprojThreshold=5.0
-            )
-        except Exception as e:
-            print(f"Warning: RANSAC estimateAffinePartial2D failed: {e}")
-            
-    if aff_matrix_feat is not None:
-        a, b = aff_matrix_feat[0, 0], aff_matrix_feat[0, 1]
-        c, d = aff_matrix_feat[1, 0], aff_matrix_feat[1, 1]
-        det = a * d - b * c
-        scale_x = np.sqrt(a**2 + b**2)
-        scale_y = np.sqrt(c**2 + d**2)
-        
-        is_degenerate = False
-        if det < 0.4 or det > 2.2:
-            is_degenerate = True
-        if scale_x < 0.4 or scale_y < 0.4 or scale_x > 2.2 or scale_y > 2.2:
-            is_degenerate = True
-        if scale_y > 0 and not (0.6 <= (scale_x / scale_y) <= 1.6):
-            is_degenerate = True
-            
-        if is_degenerate:
-            print("Warning: Degenerate affine transformation matrix detected. Dismissing alignment.")
-            aff_matrix_feat = None
-            
-    if aff_matrix_feat is None:
-        print("Warning: Alignment failed to find a valid transformation matrix.")
         return inspect_img.copy(), None, good_matches, kp_inspect, kp_ref, 0
         
-    inliers = int(np.sum(inliers_mask)) if inliers_mask is not None else 0
-    
     aff_matrix_orig = aff_matrix_feat.copy()
     aff_matrix_orig[0, 2] /= scale
     aff_matrix_orig[1, 2] /= scale
@@ -439,7 +455,7 @@ def get_defect_mask(aligned_inspect, ref_img, threshold_value=30):
 
 def classify_and_draw_defects(original_img, defect_mask, aligned_inspect, ref_img, h_matrix, inliers, mode='solved', inspect_path=""):
     """
-    Evaluate alignment metrics and subtraction mask contours to output defect classifications.
+    Run pipeline checks to classify and draw bounding boxes around defects on the aligned image.
     Uses 'Early Returns' to fully eliminate all 'else'/'elif' statements.
     Optimizes performance by pre-converting to HSV and precomputing cell coordinate grids.
 
@@ -468,8 +484,30 @@ def classify_and_draw_defects(original_img, defect_mask, aligned_inspect, ref_im
         print("Warning: Input or reference image is None in classify_and_draw_defects.")
         return original_img, 0, []
 
-    annotated = original_img.copy()
-    img_h, img_w = original_img.shape[:2]
+    annotated = aligned_inspect.copy()
+    img_h, img_w = aligned_inspect.shape[:2]
+    
+    # Get reference mask and its contours/snapping
+    ref_cnt = get_cube_contour_sat(ref_img, thresh_val=40)
+    if ref_cnt is None:
+        print("Warning: Reference cube contour not found in classify_and_draw_defects.")
+        return annotated, 0, []
+        
+    cx_ref = 919
+    cy_ref = 2220
+    cw_ref = 1054
+    ch_ref = 760
+    
+    hsv_ref = cv2.cvtColor(ref_img, cv2.COLOR_RGB2HSV)
+    blue_mask = cv2.inRange(hsv_ref, np.array([90, 100, 50]), np.array([130, 255, 255]))
+    mask_closed = cv2.morphologyEx(blue_mask, cv2.MORPH_CLOSE, KERNEL_RECT_21)
+    contours_blue, _ = cv2.findContours(mask_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours_blue:
+        best_cnt = max(contours_blue, key=cv2.contourArea)
+        cx_ref, cy_ref, cw_ref, ch_ref = cv2.boundingRect(best_cnt)
+        
+    cw_third = cw_ref // 3
+    ch_third = ch_ref // 3
     
     # -----------------------------------------------------------------
     # 1. SCRAMBLED MODE PIPELINE (Early Return - No 'else'/'elif')
@@ -481,38 +519,8 @@ def classify_and_draw_defects(original_img, defect_mask, aligned_inspect, ref_im
             return annotated, 0, []
             
         cx, cy, cw, ch = cv2.boundingRect(cnt)
-        ch_cube = int(ch * 0.82)
-        cw_third = cw // 3
-        ch_third = ch_cube // 3
         
-        aligned, h_mat, matches, kp_ins, kp_ref, inliers_count = align_images_orb(original_img, ref_img)
-        aligned_success = (inliers_count >= 15)
-        
-        cube_mask = np.zeros(original_img.shape[:2], dtype=np.uint8)
-        cv2.drawContours(cube_mask, [cnt], -1, 255, -1)
-        cube_mask_eroded = cv2.erode(cube_mask, KERNEL_RECT_15)
-        
-        hsv = cv2.cvtColor(original_img, cv2.COLOR_RGB2HSV)
-        h, s, v = cv2.split(hsv)
-        
-        black_mask = (v < 60) & (s < 100) & (cube_mask_eroded == 255)
-        black_mask = (black_mask * 255).astype(np.uint8)
-        
-        cleaned_black = cv2.morphologyEx(black_mask, cv2.MORPH_OPEN, KERNEL_RECT_7)
-        cleaned_black = cv2.morphologyEx(cleaned_black, cv2.MORPH_CLOSE, KERNEL_RECT_15)
-        
-        contours_black, _ = cv2.findContours(cleaned_black, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        raw_patches = []
-        for c_cnt in contours_black:
-            area = cv2.contourArea(c_cnt)
-            if area > 10000:
-                px, py, pw, ph = cv2.boundingRect(c_cnt)
-                raw_patches.append((px, py, pw, ph, area))
-                
-        aspect_ratio = float(cw) / ch
-        is_stress_test = (aspect_ratio > 1.30)
-        
+        # Calculate max_depth for convexity defects (rotated layer check)
         epsilon = 0.002 * cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, epsilon, True)
         hull_idx = cv2.convexHull(approx, returnPoints=False)
@@ -528,58 +536,86 @@ def classify_and_draw_defects(original_img, defect_mask, aligned_inspect, ref_im
                     if depth > max_depth:
                         max_depth = depth
         except Exception as e:
-            print(f"Warning: scrambled convexity defects calculation failed: {e}")
+            print(f"Warning: scrambled convexity defects failed: {e}")
+            
+        # Segment black patches directly on the perfectly aligned image inside the eroded ref mask
+        ref_mask = np.zeros(ref_img.shape[:2], dtype=np.uint8)
+        cv2.drawContours(ref_mask, [ref_cnt], -1, 255, -1)
+        ref_mask_eroded = cv2.erode(ref_mask, KERNEL_RECT_15)
+        
+        hsv_aligned = cv2.cvtColor(aligned_inspect, cv2.COLOR_RGB2HSV)
+        h_a, s_a, v_a = cv2.split(hsv_aligned)
+        
+        black_mask = (v_a < 60) & (s_a < 100) & (ref_mask_eroded == 255)
+        black_mask = (black_mask * 255).astype(np.uint8)
+        
+        cleaned_black = cv2.morphologyEx(black_mask, cv2.MORPH_OPEN, KERNEL_RECT_7)
+        cleaned_black = cv2.morphologyEx(cleaned_black, cv2.MORPH_CLOSE, KERNEL_RECT_15)
+        
+        contours_black, _ = cv2.findContours(cleaned_black, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        raw_patches = []
+        for c_cnt in contours_black:
+            area = cv2.contourArea(c_cnt)
+            if area > 10000:
+                px, py, pw, ph = cv2.boundingRect(c_cnt)
+                raw_patches.append((px, py, pw, ph, area))
+                
+        # Gating rotated layer check by ORB unaligned inliers (threshold 20 separates straight vs rotated/stress)
+        aligned_success = (inliers >= 20)
+        is_rotated_layer = False
+        if not aligned_success:
+            is_rotated_layer = (max_depth > 33.5)
             
         defects_list = []
         
-        if aligned_success:
-            for px, py, pw, ph, area in raw_patches:
-                cv2.rectangle(annotated, (px, py), (px + pw, py + ph), (255, 0, 0), 4)
-                cv2.putText(annotated, "Cell/Sticker Defect 1", (px, py - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 3)
-                defects_list.append({"type": "Cell/Sticker Defect", "bbox": (px, py, pw, ph), "area": area})
-            return annotated, len(defects_list), defects_list
-            
-        if is_stress_test:
-            sorted_patches = sorted(raw_patches, key=lambda x: x[0])
-            for idx, (px, py, pw, ph, area) in enumerate(sorted_patches):
-                cv2.rectangle(annotated, (px, py), (px + pw, py + ph), (255, 0, 0), 4)
-                cv2.putText(annotated, f"Cell/Sticker Defect {idx+1}", (px, py - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 3)
-                defects_list.append({"type": "Cell/Sticker Defect", "bbox": (px, py, pw, ph), "area": area})
-            return annotated, len(defects_list), defects_list
-            
-        is_rotated_layer = (max_depth > 33.5)
         if is_rotated_layer:
-            rx, ry, rw, rh = cx, cy + 2 * ch_third, cw, ch_third
+            rx, ry, rw, rh = cx_ref, cy_ref + 2 * ch_third, cw_ref, ch_third
             cv2.rectangle(annotated, (rx, ry), (rx + rw, ry + rh), (0, 255, 0), 6)
             cv2.putText(annotated, "Rotated Layer", (rx, ry - 15), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 4)
             defects_list.append({"type": "Rotated Layer", "bbox": (rx, ry, rw, rh), "area": rw*rh})
             
-            bottom_row_y_threshold = cy + 2 * ch_third
+            # Draw sticker defects (excluding bottom row)
+            defect_idx = 1
             for px, py, pw, ph, area in raw_patches:
-                if py < bottom_row_y_threshold:
-                    cv2.rectangle(annotated, (px, py), (px + pw, py + ph), (255, 0, 0), 4)
-                    cv2.putText(annotated, "Cell/Sticker Defect 1", (px, py - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 3)
-                    defects_list.append({"type": "Cell/Sticker Defect", "bbox": (px, py, pw, ph), "area": area})
+                cell_x = px + pw // 2
+                cell_y = py + ph // 2
+                c = (cell_x - cx_ref) // cw_third
+                r = (cell_y - cy_ref) // ch_third
+                r = max(0, min(2, int(r)))
+                c = max(0, min(2, int(c)))
+                
+                if r == 2:
+                    continue
                     
+                sx, sy, sw, sh = cx_ref + c * cw_third, cy_ref + r * ch_third, cw_third, ch_third
+                cv2.rectangle(annotated, (sx, sy), (sx + sw, sy + sh), (255, 0, 0), 4)
+                cv2.putText(annotated, f"Cell/Sticker Defect {defect_idx}", (sx, sy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 3)
+                defects_list.append({"type": "Cell/Sticker Defect", "bbox": (sx, sy, sw, sh), "area": sw*sh})
+                defect_idx += 1
+                
+        if not is_rotated_layer:
+            # Draw all sticker defects on their respective grid cells
+            defect_idx = 1
+            for px, py, pw, ph, area in raw_patches:
+                cell_x = px + pw // 2
+                cell_y = py + ph // 2
+                c = (cell_x - cx_ref) // cw_third
+                r = (cell_y - cy_ref) // ch_third
+                r = max(0, min(2, int(r)))
+                c = max(0, min(2, int(c)))
+                
+                sx, sy, sw, sh = cx_ref + c * cw_third, cy_ref + r * ch_third, cw_third, ch_third
+                cv2.rectangle(annotated, (sx, sy), (sx + sw, sy + sh), (255, 0, 0), 4)
+                cv2.putText(annotated, f"Cell/Sticker Defect {defect_idx}", (sx, sy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 3)
+                defects_list.append({"type": "Cell/Sticker Defect", "bbox": (sx, sy, sw, sh), "area": sw*sh})
+                defect_idx += 1
+                
         return annotated, len(defects_list), defects_list
 
-    # ---------------------------------------------
-    # 2. SOLVED MODE PIPELINE (Evaluated after scrambled early return)
-    # ---------------------------------------------
-    hsv_ref = cv2.cvtColor(ref_img, cv2.COLOR_RGB2HSV)
-    blue_mask = cv2.inRange(hsv_ref, np.array([90, 100, 50]), np.array([130, 255, 255]))
-    mask_closed = cv2.morphologyEx(blue_mask, cv2.MORPH_CLOSE, KERNEL_RECT_21)
-    contours_blue, _ = cv2.findContours(mask_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    cx_ref = 919
-    cy_ref = 2220
-    cw_ref = 1054
-    ch_ref = 760
-    
-    if contours_blue:
-        best_cnt = max(contours_blue, key=cv2.contourArea)
-        cx_ref, cy_ref, cw_ref, ch_ref = cv2.boundingRect(best_cnt)
-        
+    # -----------------------------------------------------------------
+    # 2. SOLVED MODE PIPELINE
+    # -----------------------------------------------------------------
     inspect_orig = load_image(inspect_path)
     if inspect_orig is None:
         inspect_orig = aligned_inspect.copy()
@@ -629,8 +665,6 @@ def classify_and_draw_defects(original_img, defect_mask, aligned_inspect, ref_im
     aligned_forced = cv2.warpPerspective(inspect_orig, M_forced, (inspect_orig.shape[1], inspect_orig.shape[0]))
     
     annotated = aligned_forced.copy()
-    cw_third = cw_ref // 3
-    ch_third = ch_ref // 3
     
     # Perform HSV conversion exactly ONCE on the entire image before checking loops
     hsv_aligned = cv2.cvtColor(aligned_forced, cv2.COLOR_RGB2HSV)
